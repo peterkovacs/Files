@@ -273,7 +273,9 @@ fileprivate extension Storage {
 
     func copy(to newPath: String) throws {
         do {
-            try fileManager.copyItem(atPath: path, toPath: newPath)
+            try fileManager.copyItem(at: URL(fileURLWithPath: path),
+                                     to: URL(fileURLWithPath: newPath))
+
         } catch {
             throw LocationError(path: path, reason: .copyFailed(error))
         }
