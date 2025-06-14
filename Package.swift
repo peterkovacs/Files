@@ -1,4 +1,4 @@
-// swift-tools-version:5.0
+// swift-tools-version:6.1
 
 /**
  *  Files
@@ -10,6 +10,10 @@ import PackageDescription
 
 let package = Package(
     name: "Files",
+    platforms: [
+        .macOS(.v15),
+        .iOS(.v18),
+    ],
     products: [
         .library(name: "Files", targets: ["Files"])
     ],

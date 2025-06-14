@@ -23,6 +23,7 @@
  */
 
 import Foundation
+import Synchronization
 
 // MARK: - Locations
 
@@ -49,7 +50,7 @@ public protocol Location: Equatable, CustomStringConvertible {
 
 public extension Location {
     static func ==(lhs: Self, rhs: Self) -> Bool {
-        return lhs.storage.path == rhs.storage.path
+        return lhs.storage.path.withLock(\.self) == rhs.storage.path.withLock(\.self)
     }
 
     var description: String {
@@ -59,7 +60,7 @@ public extension Location {
 
     /// The path of this location, relative to the root of the file system.
     var path: String {
-        return storage.path
+        return storage.path.withLock(\.self)
     }
 
     /// A URL representation of the location's `path`.
@@ -199,52 +200,58 @@ public extension Location {
 /// Type used to store information about a given file system location. You don't
 /// interact with this type as part of the public API, instead you use the APIs
 /// exposed by `Location`, `File`, and `Folder`.
-public final class Storage<LocationType: Location> {
-    fileprivate private(set) var path: String
+public final class Storage<LocationType: Location>: @unchecked Sendable {
+    fileprivate let path: Mutex<String>
     private let fileManager: FileManager
 
     fileprivate init(path: String, fileManager: FileManager) throws {
-        self.path = path
         self.fileManager = fileManager
+        self.path = .init(path)
         try validatePath()
     }
 
     private func validatePath() throws {
-        switch LocationType.kind {
-        case .file:
-            guard !path.isEmpty else {
-                throw LocationError(path: path, reason: .emptyFilePath)
-            }
-        case .folder:
-            if path.isEmpty { path = fileManager.currentDirectoryPath }
-            if !path.hasSuffix("/") { path += "/" }
-        }
-
-        if path.hasPrefix("~") {
-            let homePath = ProcessInfo.processInfo.environment["HOME"]!
-            path = homePath + path.dropFirst()
-        }
-
-        while let parentReferenceRange = path.range(of: "../") {
-            let folderPath = String(path[..<parentReferenceRange.lowerBound])
-            let parentPath = makeParentPath(for: folderPath) ?? "/"
-
-            guard fileManager.locationExists(at: parentPath, kind: .folder) else {
-                throw LocationError(path: parentPath, reason: .missing)
+        try path.withLock { path in
+            switch LocationType.kind {
+            case .file:
+                guard !path.isEmpty else {
+                    throw LocationError(path: path, reason: .emptyFilePath)
+                }
+            case .folder:
+                if path.isEmpty { path = fileManager.currentDirectoryPath }
+                if !path.hasSuffix("/") { path += "/" }
             }
 
-            path.replaceSubrange(..<parentReferenceRange.upperBound, with: parentPath)
-        }
+            if path.hasPrefix("~") {
+                let homePath = ProcessInfo.processInfo.environment["HOME"]!
+                path = homePath + path.dropFirst()
+            }
 
-        guard fileManager.locationExists(at: path, kind: LocationType.kind) else {
-            throw LocationError(path: path, reason: .missing)
+            while let parentReferenceRange = path.range(of: "../") {
+                let folderPath = String(path[..<parentReferenceRange.lowerBound])
+                let parentPath = makeParentPath(for: folderPath) ?? "/"
+
+                guard fileManager.locationExists(at: parentPath, kind: .folder) else {
+                    throw LocationError(path: parentPath, reason: .missing)
+                }
+
+                path.replaceSubrange(..<parentReferenceRange.upperBound, with: parentPath)
+            }
+
+            guard fileManager.locationExists(at: path, kind: LocationType.kind) else {
+                throw LocationError(path: path, reason: .missing)
+            }
         }
     }
 }
 
 fileprivate extension Storage {
     var attributes: [FileAttributeKey : Any] {
-        return (try? fileManager.attributesOfItem(atPath: path)) ?? [:]
+        let attributes = try? path.withLock {
+            try fileManager.attributesOfItem(atPath: $0)
+        }
+
+        return attributes ?? [:]
     }
 
     func makeParentPath(for path: String) -> String? {
@@ -257,62 +264,71 @@ fileprivate extension Storage {
 
     func move(to newPath: String,
               errorReasonProvider: (Error) -> LocationErrorReason) throws {
-        do {
-            try fileManager.moveItem(atPath: path, toPath: newPath)
+        try path.withLock { path in
+            do {
+                try fileManager.moveItem(atPath: path, toPath: newPath)
 
-            switch LocationType.kind {
-            case .file:
-                path = newPath
-            case .folder:
-                path = newPath.appendingSuffixIfNeeded("/")
+                switch LocationType.kind {
+                case .file:
+                    path = newPath
+                case .folder:
+                    path = newPath.appendingSuffixIfNeeded("/")
+                }
+            } catch {
+                throw LocationError(path: path, reason: errorReasonProvider(error))
             }
-        } catch {
-            throw LocationError(path: path, reason: errorReasonProvider(error))
         }
     }
 
     func copy(to newPath: String) throws {
-        do {
-            try fileManager.copyItem(at: URL(fileURLWithPath: path),
-                                     to: URL(fileURLWithPath: newPath))
+        try path.withLock { path in
+            do {
+                try fileManager.copyItem(at: URL(fileURLWithPath: path),
+                                               to: URL(fileURLWithPath: newPath))
 
-        } catch {
-            throw LocationError(path: path, reason: .copyFailed(error))
+            } catch {
+                throw LocationError(path: path, reason: .copyFailed(error))
+            }
         }
     }
 
     func delete() throws {
-        do {
-            try fileManager.removeItem(atPath: path)
-        } catch {
-            throw LocationError(path: path, reason: .deleteFailed(error))
+        try path.withLock { path in
+            do {
+                try fileManager.removeItem(atPath: path)
+            } catch {
+                throw LocationError(path: path, reason: .deleteFailed(error))
+            }
         }
     }
 }
 
 private extension Storage where LocationType == Folder {
     func makeChildSequence<T: Location>() -> Folder.ChildSequence<T> {
-        return Folder.ChildSequence(
-            folder: Folder(storage: self),
-            fileManager: fileManager,
-            isRecursive: false,
-            includeHidden: false
-        )
+        path.withLock { state in
+            return Folder.ChildSequence(
+                folder: Folder(storage: self),
+                fileManager: fileManager,
+                isRecursive: false,
+                includeHidden: false
+            )
+        }
     }
 
     func subfolder(at folderPath: String) throws -> Folder {
-        let folderPath = path + folderPath.removingPrefix("/")
+        let folderPath = path.withLock(\.self) + folderPath.removingPrefix("/")
         let storage = try Storage(path: folderPath, fileManager: fileManager)
         return Folder(storage: storage)
     }
 
     func file(at filePath: String) throws -> File {
-        let filePath = path + filePath.removingPrefix("/")
+        let filePath = path.withLock(\.self) + filePath.removingPrefix("/")
         let storage = try Storage<File>(path: filePath, fileManager: fileManager)
         return File(storage: storage)
     }
 
     func createSubfolder(at folderPath: String) throws -> Folder {
+        let path = path.withLock(\.self)
         let folderPath = path + folderPath.removingPrefix("/")
 
         guard folderPath != path else {
@@ -330,9 +346,11 @@ private extension Storage where LocationType == Folder {
         } catch {
             throw WriteError(path: folderPath, reason: .folderCreationFailed(error))
         }
+
     }
 
     func createFile(at filePath: String, contents: Data?) throws -> File {
+        let path = path.withLock(\.self)
         let filePath = path + filePath.removingPrefix("/")
 
         guard let parentPath = makeParentPath(for: filePath) else {
@@ -364,7 +382,7 @@ private extension Storage where LocationType == Folder {
 /// Type that represents a file on disk. You can either reference an existing
 /// file by initializing an instance with a `path`, or you can create new files
 /// using the various `createFile...` APIs available on `Folder`.
-public struct File: Location {
+public struct File: Location, Sendable {
     public let storage: Storage<File>
 
     public init(storage: Storage<File>) {
@@ -466,7 +484,7 @@ import AppKit
 public extension File {
     /// Open the file.
     func open() {
-        NSWorkspace.shared.openFile(path)
+        NSWorkspace.shared.open(.init(filePath: path, directoryHint: .notDirectory))
     }
 }
 
@@ -477,7 +495,7 @@ public extension File {
 /// Type that represents a folder on disk. You can either reference an existing
 /// folder by initializing an instance with a `path`, or you can create new
 /// subfolders using this type's various `createSubfolder...` APIs.
-public struct Folder: Location {
+public struct Folder: Location, Sendable {
     public let storage: Storage<Folder>
 
     public init(storage: Storage<Folder>) {
@@ -934,7 +952,7 @@ public extension Folder {
 // MARK: - Errors
 
 /// Error type thrown by all of Files' throwing APIs.
-public struct FilesError<Reason>: Error {
+public struct FilesError<Reason: Sendable>: Error, Sendable {
     /// The absolute path that the error occured at.
     public var path: String
     /// The reason that the error occured.
@@ -959,7 +977,7 @@ extension FilesError: CustomStringConvertible {
 }
 
 /// Enum listing reasons that a location manipulation could fail.
-public enum LocationErrorReason {
+public enum LocationErrorReason: Sendable {
     /// The location couldn't be found.
     case missing
     /// An empty path was given when refering to a file.
@@ -982,7 +1000,7 @@ public enum LocationErrorReason {
 }
 
 /// Enum listing reasons that a write operation could fail.
-public enum WriteErrorReason {
+public enum WriteErrorReason: Sendable {
     /// An empty path was given when writing or creating a location.
     case emptyPath
     /// A folder couldn't be created because of an underlying system error.
@@ -996,7 +1014,7 @@ public enum WriteErrorReason {
 }
 
 /// Enum listing reasons that a read operation could fail.
-public enum ReadErrorReason {
+public enum ReadErrorReason: Sendable {
     /// A file couldn't be read because of an underlying system error.
     case readFailed(Error)
     /// Failed to decode a given set of data into a string.
